@@ -1,4 +1,4 @@
-import sys, time, requests
+import sys, time, uuid, requests
 
 BASE = "http://localhost:8000"
 key = sys.argv[1]
@@ -10,8 +10,12 @@ def post(path, **body):
 
 post("/api/device/heartbeat")
 post("/api/anpr/plate", plate=plate)
-for _ in range(3):
+for i in range(3):
     time.sleep(1)
-    post("/api/device/pulse", count=1, amount=5000)
+    eid = uuid.uuid4().hex[:16]
+    post("/api/device/pulse", event_id=eid, ts=int(time.time()), count=1, amount=5000)
+    if i == 0:
+        print("  ^ javob yo'qolgan deb, xuddi shu paketni qayta yuboramiz:")
+        post("/api/device/pulse", event_id=eid, ts=int(time.time()), count=1, amount=5000)
 time.sleep(1)
 post("/api/device/exit")

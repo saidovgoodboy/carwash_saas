@@ -1,5 +1,5 @@
 import secrets
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select, func
@@ -15,6 +15,8 @@ class KeyIn(BaseModel):
     device_key: str
 
 class PulseIn(KeyIn):
+    event_id: str
+    ts: int | None = None
     count: int
     amount: int
 
@@ -56,12 +58,19 @@ def plate(data: PlateIn, db: Session = Depends(get_db)):
 @app.post("/api/device/pulse")
 def pulse(data: PulseIn, db: Session = Depends(get_db)):
     box = get_box(db, data.device_key)
+    if db.scalar(select(Pulse).where(Pulse.event_id == data.event_id)):
+        db.commit()
+        return {"duplicate": True}
+    ev = now()
+    if data.ts and abs(data.ts - datetime.now(timezone.utc).timestamp()) < 7 * 86400:
+        ev = datetime.fromtimestamp(data.ts, timezone.utc).replace(tzinfo=None)
     s = get_open_session(db, box.id)
     s.pulse_count += data.count
     s.total_amount += data.amount
-    db.add(Pulse(session_id=s.id, box_id=box.id, count=data.count, amount=data.amount))
+    db.add(Pulse(session_id=s.id, box_id=box.id, count=data.count, amount=data.amount,
+                 event_id=data.event_id, event_time=ev))
     db.commit()
-    return {"session_id": s.id, "plate": s.plate, "total_amount": s.total_amount}
+    return {"duplicate": False, "session_id": s.id, "plate": s.plate, "total_amount": s.total_amount}
 
 @app.post("/api/device/exit")
 def exit_box(data: KeyIn, db: Session = Depends(get_db)):

@@ -40,6 +40,8 @@ class Pulse(Base):
     count: Mapped[int]
     amount: Mapped[int]
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    event_id: Mapped[str | None] = mapped_column(String(40), unique=True, nullable=True)
+    event_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 class User(Base):
     __tablename__ = "users"
