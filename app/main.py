@@ -163,3 +163,76 @@ def expire(tenant_id: int, _: User = Depends(super_admin), db: Session = Depends
     t.paid_until = now() - timedelta(days=1)
     db.commit()
     return {"paid_until": t.paid_until.isoformat()}
+
+from collections import defaultdict
+UZ = timedelta(hours=5)
+
+def resolve_tenant(user: User, tenant_id: int | None, db: Session) -> Tenant:
+    if user.role == "tenant":
+        t = db.get(Tenant, user.tenant_id)
+        if t.paid_until < now():
+            raise HTTPException(402, "Abonement muddati tugadi. Xizmatni davom ettirish uchun to'lov qiling")
+        return t
+    if not tenant_id:
+        raise HTTPException(400, "tenant_id kerak")
+    t = db.get(Tenant, tenant_id)
+    if not t:
+        raise HTTPException(404, "Tenant topilmadi")
+    return t
+
+def closed_sessions(db: Session, t: Tenant):
+    return db.execute(
+        select(WashSession, Box.name)
+        .join(Box, Box.id == WashSession.box_id)
+        .where(Box.tenant_id == t.id, WashSession.ended_at.is_not(None))
+        .order_by(WashSession.started_at.desc())).all()
+
+@app.get("/api/analytics/revenue")
+def an_revenue(period: str = "day", tenant_id: int | None = None,
+               user: User = Depends(current_user), db: Session = Depends(get_db)):
+    t = resolve_tenant(user, tenant_id, db)
+    buckets = defaultdict(lambda: {"cars": 0, "revenue": 0})
+    for s, _ in closed_sessions(db, t):
+        d = s.started_at + UZ
+        if period == "month":
+            key = d.strftime("%Y-%m")
+        elif period == "week":
+            iso = d.isocalendar()
+            key = f"{iso[0]}-W{iso[1]:02d}"
+        else:
+            key = d.strftime("%Y-%m-%d")
+        buckets[key]["cars"] += 1
+        buckets[key]["revenue"] += s.total_amount
+    return [{"period": k, **v, "avg_check": round(v["revenue"] / v["cars"])}
+            for k, v in sorted(buckets.items())]
+
+@app.get("/api/analytics/peak-hours")
+def an_peak(tenant_id: int | None = None,
+            user: User = Depends(current_user), db: Session = Depends(get_db)):
+    t = resolve_tenant(user, tenant_id, db)
+    hours = [0] * 24
+    for s, _ in closed_sessions(db, t):
+        hours[(s.started_at + UZ).hour] += 1
+    return [{"hour": h, "cars": c} for h, c in enumerate(hours)]
+
+@app.get("/api/analytics/boxes")
+def an_boxes(tenant_id: int | None = None,
+             user: User = Depends(current_user), db: Session = Depends(get_db)):
+    t = resolve_tenant(user, tenant_id, db)
+    boxes = defaultdict(lambda: {"cars": 0, "revenue": 0, "busy_min": 0.0})
+    for s, name in closed_sessions(db, t):
+        b = boxes[name]
+        b["cars"] += 1
+        b["revenue"] += s.total_amount
+        b["busy_min"] += round((s.ended_at - s.started_at).total_seconds() / 60, 1)
+    return [{"box": n, **v} for n, v in sorted(boxes.items())]
+
+@app.get("/api/analytics/log")
+def an_log(limit: int = 50, tenant_id: int | None = None,
+           user: User = Depends(current_user), db: Session = Depends(get_db)):
+    t = resolve_tenant(user, tenant_id, db)
+    return [{"plate": s.plate, "box": name,
+             "started_at": (s.started_at + UZ).isoformat(timespec="seconds"),
+             "duration_sec": int((s.ended_at - s.started_at).total_seconds()),
+             "amount": s.total_amount}
+            for s, name in closed_sessions(db, t)[:limit]]
