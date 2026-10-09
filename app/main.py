@@ -5,7 +5,8 @@ from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 from .database import engine, get_db
-from .models import Base, Tenant, Box, WashSession, Pulse, now
+from .models import Base, Tenant, Box, WashSession, Pulse, User, now
+from .auth import current_user, super_admin, verify_password, hash_password, create_token
 
 Base.metadata.create_all(engine)
 app = FastAPI(title="CarWash SaaS")
@@ -76,37 +77,77 @@ def exit_box(data: KeyIn, db: Session = Depends(get_db)):
             "duration_sec": int((s.ended_at - s.started_at).total_seconds()),
             "total_amount": s.total_amount}
 
-@app.get("/api/tenant/{tenant_id}/stats")
-def stats(tenant_id: int, db: Session = Depends(get_db)):
-    t = db.get(Tenant, tenant_id)
-    if not t:
-        raise HTTPException(404, "Tenant topilmadi")
-    if t.paid_until < now():
-        raise HTTPException(402, "Abonement muddati tugadi. Xizmatni davom ettirish uchun to'lov qiling")
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+class TenantIn(BaseModel):
+    name: str
+    owner_email: str
+    owner_password: str
+    boxes: int = 2
+    days: int = 30
+
+def tenant_stats(db: Session, t: Tenant):
     cars, revenue = db.execute(
         select(func.count(WashSession.id), func.coalesce(func.sum(WashSession.total_amount), 0))
-        .join(Box, Box.id == WashSession.box_id).where(Box.tenant_id == tenant_id)).one()
+        .join(Box, Box.id == WashSession.box_id).where(Box.tenant_id == t.id)).one()
     return {"tenant": t.name, "cars": cars, "revenue": revenue,
             "avg_check": round(revenue / cars) if cars else 0,
             "paid_until": t.paid_until.isoformat()}
 
-@app.post("/api/admin/seed")
-def seed(db: Session = Depends(get_db)):
-    if db.scalar(select(Tenant)):
-        raise HTTPException(400, "Demo ma'lumotlar allaqachon bor")
-    t = Tenant(name="Demo Shoxobcha", paid_until=now() + timedelta(days=30))
+@app.post("/api/auth/login")
+def login(data: LoginIn, db: Session = Depends(get_db)):
+    u = db.scalar(select(User).where(User.email == data.email.lower()))
+    if not u or not verify_password(data.password, u.password_hash):
+        raise HTTPException(401, "Email yoki parol noto'g'ri")
+    return {"token": create_token(u), "role": u.role, "tenant_id": u.tenant_id}
+
+@app.get("/api/tenant/stats")
+def my_stats(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if user.role != "tenant":
+        raise HTTPException(400, "Bu endpoint shoxobcha egalari uchun")
+    t = db.get(Tenant, user.tenant_id)
+    if t.paid_until < now():
+        raise HTTPException(402, "Abonement muddati tugadi. Xizmatni davom ettirish uchun to'lov qiling")
+    return tenant_stats(db, t)
+
+@app.get("/api/admin/tenants")
+def list_tenants(_: User = Depends(super_admin), db: Session = Depends(get_db)):
+    out = []
+    for t in db.scalars(select(Tenant)):
+        boxes = db.scalars(select(Box).where(Box.tenant_id == t.id)).all()
+        online = sum(1 for b in boxes if b.last_seen and (now() - b.last_seen).total_seconds() < 120)
+        out.append({"id": t.id, "name": t.name, "paid_until": t.paid_until.isoformat(),
+                    "active": t.paid_until >= now(), "boxes": len(boxes), "boxes_online": online})
+    return out
+
+@app.post("/api/admin/tenants")
+def create_tenant(data: TenantIn, _: User = Depends(super_admin), db: Session = Depends(get_db)):
+    if db.scalar(select(User).where(User.email == data.owner_email.lower())):
+        raise HTTPException(400, "Bu email band")
+    t = Tenant(name=data.name, paid_until=now() + timedelta(days=data.days))
     db.add(t)
     db.flush()
+    db.add(User(email=data.owner_email.lower(), password_hash=hash_password(data.owner_password),
+                role="tenant", tenant_id=t.id))
     keys = []
-    for i in (1, 2):
+    for i in range(1, data.boxes + 1):
         key = secrets.token_hex(8)
         db.add(Box(tenant_id=t.id, name=f"Boks {i}", device_key=key))
         keys.append(key)
     db.commit()
     return {"tenant_id": t.id, "device_keys": keys}
 
+@app.get("/api/admin/tenant/{tenant_id}/stats")
+def admin_stats(tenant_id: int, _: User = Depends(super_admin), db: Session = Depends(get_db)):
+    t = db.get(Tenant, tenant_id)
+    if not t:
+        raise HTTPException(404, "Tenant topilmadi")
+    return tenant_stats(db, t)
+
 @app.post("/api/admin/tenant/{tenant_id}/extend")
-def extend(tenant_id: int, days: int = 30, db: Session = Depends(get_db)):
+def extend(tenant_id: int, days: int = 30, _: User = Depends(super_admin), db: Session = Depends(get_db)):
     t = db.get(Tenant, tenant_id)
     if not t:
         raise HTTPException(404, "Tenant topilmadi")
@@ -115,7 +156,7 @@ def extend(tenant_id: int, days: int = 30, db: Session = Depends(get_db)):
     return {"paid_until": t.paid_until.isoformat()}
 
 @app.post("/api/admin/tenant/{tenant_id}/expire")
-def expire(tenant_id: int, db: Session = Depends(get_db)):
+def expire(tenant_id: int, _: User = Depends(super_admin), db: Session = Depends(get_db)):
     t = db.get(Tenant, tenant_id)
     if not t:
         raise HTTPException(404, "Tenant topilmadi")

@@ -40,3 +40,11 @@ class Pulse(Base):
     count: Mapped[int]
     amount: Mapped[int]
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(100), unique=True)
+    password_hash: Mapped[str] = mapped_column(String(200))
+    role: Mapped[str] = mapped_column(String(10))
+    tenant_id: Mapped[int | None] = mapped_column(ForeignKey("tenants.id"), nullable=True)
